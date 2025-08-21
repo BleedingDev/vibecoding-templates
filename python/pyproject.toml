@@ -1,0 +1,21 @@
+[project]
+name = "graph-memory"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "graphiti-core>=0.10.5",
+    "pydantic[email,timezone]>=2.11.3",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.11.6",
+]
+
+[tool.uv.pip]
+# Set generate-hashes for uv
+generate-hashes = true
+[tool.mypy]
+plugins = ['pydantic.mypy']

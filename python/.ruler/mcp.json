@@ -1,0 +1,15 @@
+{
+	"mcpServers": {
+		"pypi-mcp-server": {
+			"command": "bunx",
+			"args": [
+				"-y",
+				"@smithery/cli@latest",
+				"run",
+				"@JackKuo666/pypi-mcp-server",
+				"--key",
+				"083a7a7e-d0a8-4248-b120-4645ba6b3c48"
+			]
+		}
+	}
+}
