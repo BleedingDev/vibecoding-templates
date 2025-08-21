@@ -13,6 +13,10 @@
 			"args": ["-y", "@upstash/context7-mcp@latest"],
 			"disabled": false,
 			"alwaysAllow": ["resolve-library-id", "get-library-docs"]
+		},
+		"css-first": {
+			"command": "bunx",
+			"args": ["-y", "@depthark/css-first"]
 		}
 	}
 }
