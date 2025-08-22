@@ -1,0 +1,774 @@
+---
+description: 
+globs: **/*-usecase.ts,**/usecase.ts
+alwaysApply: false
+---
+# Effect-TS Usecase Implementation Patterns and Best Practices
+
+## Import Patterns
+
+See `.rules/imports-and-conventions.md` for import and naming conventions.
+
+## MANDATORY Usecase Structure
+
+### Required Error Handling and Observability Pattern
+**EVERY usecase MUST follow this exact pattern:**
+
+```typescript
+export const myUsecase = (input: MyInput) =>
+  Effect.gen(function* () {
+    // Business logic implementation here...
+    const result = yield* businessLogic(input)
+    return result
+  }).pipe(
+    // 🔴 MANDATORY: Simple error logging - NO custom messages
+    Effect.tapError(Effect.logError),
+    // 🔴 MANDATORY: Use Effect.orDie for unexpected errors OR allow domain errors to bubble up
+    Effect.orDie, // Use this for usecases that should only return success
+    // 🔴 MANDATORY: Observability span with relevant attributes
+    Effect.withSpan('my-usecase-name', { 
+      attributes: { 
+        // Only include primitive values, not entire objects
+        userId: input.userId,
+        page: input.page 
+      } 
+    }),
+  )
+```
+
+### Error Handling Strategy by Usecase Type
+
+#### GET Usecases - Allow NotFoundError to Bubble Up
+```typescript
+// ✅ CORRECT - Allow NotFoundError for client handling
+export const getBlogByIdUsecase = (id: BlogPostId) =>
+  Effect.gen(function* () {
+    const blogStore = yield* BlogStore
+    const userStore = yield* UserStore
+
+    const blogPost = yield* blogStore.getById(id) // Can throw NotFoundError
+    const author = yield* userStore.getAuthorById(blogPost.authorId)
+    
+    return BlogPostProfile.make({
+      // ... transformation
+    })
+  }).pipe(
+    Effect.tapError(Effect.logError), // ✅ Simple logging only
+    // ❌ NO Effect.orDie - let NotFoundError bubble up
+    Effect.withSpan('getBlogByIdUsecase', { 
+      attributes: { blogPostId: id } 
+    })
+  )
+```
+
+#### CREATE Usecases - Allow ConflictError to Bubble Up
+```typescript
+// ✅ CORRECT - Allow ConflictError for client handling
+export const createBlogPostUsecase = (input: CreateBlogPostInput) =>
+  Effect.gen(function* () {
+    const blogStore = yield* BlogStore
+    
+    const blogPost = BlogPost.make({
+      // ... blog post creation
+    })
+    
+    const result = yield* blogStore.create(blogPost) // Can throw ConflictError
+    return result
+  }).pipe(
+    Effect.tapError(Effect.logError), // ✅ Simple logging only
+    // ❌ NO Effect.orDie - let ConflictError bubble up
+    Effect.withSpan('createBlogPostUsecase', { 
+      attributes: { authorId: input.authorId } 
+    })
+  )
+```
+
+#### UPDATE/DELETE Usecases - Use Effect.orDie for Unexpected Errors
+```typescript
+// ✅ CORRECT - Use Effect.orDie for operations that should always succeed
+export const updateBlogPostUsecase = (id: BlogPostId, patches: BlogPostPatches) =>
+  Effect.gen(function* () {
+    const blogStore = yield* BlogStore
+    
+    // Business logic that should not fail unexpectedly
+    const result = yield* blogStore.updateAttributes(id, patches)
+    return result
+  }).pipe(
+    Effect.tapError(Effect.logError), // ✅ Simple logging only
+    Effect.orDie, // ✅ Die on any unexpected errors
+    Effect.withSpan('updateBlogPostUsecase', { 
+      attributes: { blogPostId: id } 
+    })
+  )
+```
+
+#### LIKE/DISLIKE Usecases - Allow Business Logic Errors
+```typescript
+// ✅ CORRECT - Allow domain-specific errors to bubble up
+export const likeBlogPostUsecase = (input: LikeInput) =>
+  Effect.gen(function* () {
+    const blogStore = yield* BlogStore
+    const blogPost = yield* blogStore.getById(input.id)
+    
+    // Business logic validation
+    if (blogPost.likes?.includes(input.userId)) {
+      return yield* new BlogPostAlreadyLikedError(input)
+    }
+    
+    const result = yield* blogStore.addLike(input.id, input.userId)
+    return result
+  }).pipe(
+    Effect.tapError(Effect.logError), // ✅ Simple logging only
+    // ❌ NO Effect.orDie - let business logic errors bubble up
+    Effect.withSpan('likeBlogPostUsecase', { 
+      attributes: { blogPostId: input.id, userId: input.userId } 
+    })
+  )
+```
+
+### ❌ WRONG Error Handling Anti-Patterns
+
+```typescript
+// ❌ WRONG: Verbose error logging with custom messages
+export const badUsecase = (input: MyInput) =>
+  Effect.gen(function* () {
+    const result = yield* businessLogic(input)
+    return result
+  }).pipe(
+    // ❌ WRONG: Custom error messages and JSON.stringify
+    Effect.tapError((error) =>
+      Effect.logError('badUsecase failed', JSON.stringify({ error, input }))
+    ),
+    // ❌ WRONG: Manual error formatting
+    Effect.catchAll((error) => 
+      Effect.logError(`Failed to execute badUsecase: ${error.message}`)
+    ),
+    Effect.withSpan('badUsecase')
+  )
+
+// ❌ WRONG: Using Effect.orDie when domain errors should bubble up
+export const getBlogByIdUsecase = (id: BlogPostId) =>
+  Effect.gen(function* () {
+    const result = yield* blogStore.getById(id) // NotFoundError should bubble up
+    return result
+  }).pipe(
+    Effect.tapError(Effect.logError),
+    Effect.orDie, // ❌ WRONG: This suppresses NotFoundError that client needs
+    Effect.withSpan('getBlogByIdUsecase', { attributes: { id } })
+  )
+```
+
+### Error Handling Decision Matrix
+
+| Usecase Type | Expected Domain Errors | Error Handling Strategy |
+|--------------|----------------------|------------------------|
+| **GET** (getById, getBySlug) | `NotFoundError` | Let bubble up - client needs to handle |
+| **CREATE** | `ConflictError` | Let bubble up - client needs to handle |
+| **UPDATE/DELETE** | None expected | Use `Effect.orDie` - should always succeed |
+| **LIKE/DISLIKE** | Business logic errors | Let bubble up - client needs to handle |
+| **SEARCH/LIST** | None expected | Use `Effect.orDie` - should always succeed |
+
+### ✅ CORRECT Error Logging Pattern
+```typescript
+// ✅ ALWAYS use this exact pattern - no custom messages
+Effect.tapError(Effect.logError)
+
+// ❌ NEVER use verbose logging
+Effect.tapError((error) => Effect.logError('Custom message', JSON.stringify(error)))
+Effect.tapError((error) => Effect.logError(`Failed to ${operation}:`, error.message))
+Effect.catchAll((error) => Effect.logError('Something failed', error))
+```
+
+## BlogPostProfile Transformation Pattern
+
+### When to Return BlogPostProfile vs BlogPost
+- **BlogPostProfile**: For client-facing endpoints that need author information and like/dislike counts
+- **BlogPost**: For internal operations and data storage
+
+### BlogPostProfile Transformation Pattern
+```typescript
+export const getBlogByIdUsecase = (id: BlogPostId) =>
+  Effect.gen(function* () {
+    const blogStore = yield* BlogStore
+    const userStore = yield* UserStore
+
+    // Get the blog post
+    const blogPost = yield* blogStore.getById(id)
+    yield* Effect.annotateCurrentSpan('blogPost.id', blogPost.id)
+    yield* Effect.annotateCurrentSpan('blogPost.authorId', blogPost.authorId)
+
+    // Get the author information
+    const author = yield* userStore.getAuthorById(blogPost.authorId)
+    yield* Effect.annotateCurrentSpan('author.id', author.id)
+
+    // Transform to BlogPostProfile
+    const blogPostProfile = BlogPostProfile.make({
+      id: blogPost.id,
+      author, // Replace authorId with full author object
+      cover: blogPost.cover,
+      status: blogPost.status,
+      htmlContent: blogPost.htmlContent,
+      title: blogPost.title,
+      slug: blogPost.slug,
+      summary: blogPost.summary,
+      category: blogPost.category,
+      tags: blogPost.tags,
+      readTime: blogPost.readTime,
+      createdAt: blogPost.createdAt,
+      updatedAt: blogPost.updatedAt,
+      likesCount: blogPost.likes.length, // Count instead of array
+      dislikesCount: blogPost.dislikes.length, // Count instead of array
+      views: blogPost.views,
+      featured: blogPost.featured,
+      boost: blogPost.boost,
+      publishedAt: blogPost.publishedAt,
+    })
+
+    return blogPostProfile
+  }).pipe(
+    Effect.tapError(Effect.logError),
+    Effect.withSpan('getBlogByIdUsecase', { 
+      attributes: { blogPostId: id } 
+    }),
+    Effect.annotateLogs({ 
+      usecase: 'getBlogByIdUsecase', 
+      blogPostId: id 
+    })
+  )
+```
+
+### Multiple BlogPost Transformation
+```typescript
+export const getBlogByAuthorIdUsecase = (authorId: UserId) =>
+  Effect.gen(function* () {
+    const blogStore = yield* BlogStore
+    const userStore = yield* UserStore
+
+    const blogPosts = yield* blogStore.getByAuthorId(authorId)
+    yield* Effect.annotateCurrentSpan('blogPostsCount', blogPosts.length)
+
+    // Get author once for all blog posts
+    const author = yield* userStore.getAuthorById(authorId)
+    yield* Effect.annotateCurrentSpan('author.id', author.id)
+
+    // Transform each blog post to BlogPostProfile
+    const blogPostProfiles = blogPosts.map((blogPost) =>
+      BlogPostProfile.make({
+        id: blogPost.id,
+        author, // Same author for all posts
+        // ... rest of transformation
+      })
+    )
+
+    return blogPostProfiles
+  }).pipe(
+    Effect.tapError(Effect.logError),
+    // ❌ NO Effect.orDie - let NotFoundError bubble up
+    Effect.withSpan('getBlogByAuthorIdUsecase', { 
+      attributes: { authorId } 
+    })
+  )
+```
+
+### Handler Dependencies for BlogPostProfile
+When usecases return BlogPostProfile, handlers must provide both stores:
+
+```typescript
+export const handler = _handler.pipe(
+  Effect.provide(BlogStore.Default),
+  Effect.provide(UserStore.Default), // Required for author information
+  toHandler,
+)
+```
+
+### Complete Example with Mandatory Patterns
+```typescript
+/**
+ * Creates a new blog post with default values
+ * 
+ * @param input - The input for the blog post containing authorId
+ * @returns The created blog post with all default values set
+ */
+export const createBlogPostUsecase = (input: CreateBlogPostInput) =>
+  Effect.gen(function* () {
+    // Generate unique ID for the blog post
+    const blogPostId = BlogPostId.make(randomUUID())
+    
+    // Create blog post data structure with business logic
+    const blogPostData = BlogPost.make({
+      id: blogPostId,
+      authorId: input.authorId,
+      status: 'new' as const,
+      htmlContent: '',
+      title: 'placeholder',
+      slug: 'placeholder',
+      summary: 'placeholder',
+      category: {
+        name: CategoryName.make('placeholder'),
+        slug: CategorySlug.make('placeholder'),
+      },
+      tags: [],
+      readTime: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      likes: [],
+      dislikes: [],
+      views: 0,
+      popularityScore: 0,
+      featured: false,
+      keywords: [],
+      searchableContent: 'placeholder',
+    })
+    
+    // Store the blog post
+    const blogStore = yield* BlogStore
+    const createdBlogPost = yield* blogStore.create(blogPostData)
+    
+    return createdBlogPost
+  }).pipe(
+    // ✅ CORRECT: Simple error logging and proper error handling
+    Effect.tapError(Effect.logError),
+    // ❌ NO Effect.orDie - let ConflictError bubble up for client handling
+    Effect.withSpan('createBlogPostUsecase', { 
+      attributes: { authorId: input.authorId } 
+    })
+  )
+```
+
+## Store Injection Pattern
+
+### Service Dependency Injection
+- Inject stores using `yield* StoreName` pattern
+- Use Effect.gen for business logic implementation
+- Handle store dependencies through Effect context
+
+```typescript
+export const getBlogPostUsecase = (input: GetBlogPostInput) =>
+  Effect.gen(function* () {
+    const blogStore = yield* BlogStore
+    const blogPost = yield* blogStore.getById(input.id)
+    return blogPost
+  }).pipe(
+    Effect.tapError(Effect.logError),
+    // ❌ NO Effect.orDie - let NotFoundError bubble up
+    Effect.withSpan('getBlogPostUsecase', { 
+      attributes: { blogPostId: input.id } 
+    })
+  )
+```
+
+## Observability Best Practices
+
+### ✅ CORRECT Observability Patterns
+
+```typescript
+export const getBlogByIdUsecase = (id: BlogPostId) =>
+  Effect.gen(function* () {
+    const blogStore = yield* BlogStore
+    const userStore = yield* UserStore
+
+    const blogPost = yield* blogStore.getById(id)
+    // ✅ CORRECT: Annotate specific primitive values, not entire objects
+    yield* Effect.annotateCurrentSpan('blogPost.id', blogPost.id)
+    yield* Effect.annotateCurrentSpan('blogPost.authorId', blogPost.authorId)
+
+    const author = yield* userStore.getAuthorById(blogPost.authorId)
+    yield* Effect.annotateCurrentSpan('author.id', author.id)
+
+    const blogPostProfile = BlogPostProfile.make({
+      // ... business logic transformation
+    })
+
+    return blogPostProfile
+  }).pipe(
+    // ✅ CORRECT: Simple error logging without custom messages
+    Effect.tapError(Effect.logError),
+    // ✅ CORRECT: Let NotFoundError bubble up (no Effect.orDie)
+    Effect.withSpan('getBlogByIdUsecase', { 
+      attributes: { 
+        // ✅ CORRECT: Only primitive values in span attributes
+        blogPostId: id 
+      } 
+    })
+  )
+```
+
+### ❌ WRONG Observability Anti-Patterns
+
+```typescript
+// ❌ WRONG: Excessive manual logging and verbose error handling
+export const badUsecase = (input: MyInput) =>
+  Effect.gen(function* () {
+    yield* Effect.logInfo('badUsecase started', JSON.stringify(input)) // ❌ Unnecessary
+    
+    const result = yield* businessLogic(input)
+    yield* Effect.annotateCurrentSpan('result', JSON.stringify(result)) // ❌ Large objects
+    
+    yield* Effect.logInfo('badUsecase completed', JSON.stringify(result)) // ❌ Redundant
+    return result
+  }).pipe(
+    // ❌ WRONG: Custom error messages and JSON.stringify
+    Effect.tapError((error) =>
+      Effect.logError('badUsecase failed', JSON.stringify({ error, input }))
+    ),
+    Effect.withSpan('badUsecase', { attributes: { input } }) // ❌ Complex objects
+  )
+```
+
+### Span Annotation Guidelines
+
+```typescript
+// ✅ CORRECT: Annotate primitive values and key metrics
+yield* Effect.annotateCurrentSpan('blogPost.likesCount', blogPost.likes.length)
+yield* Effect.annotateCurrentSpan('userAlreadyLiked', blogPost.likes?.includes(userId))
+yield* Effect.annotateCurrentSpan('finalLikesCount', result.likesCount)
+
+// ❌ WRONG: Annotating large objects
+yield* Effect.annotateCurrentSpan('blogPost', JSON.stringify(blogPost))
+yield* Effect.annotateCurrentSpan('result', JSON.stringify(result))
+```
+
+### Required Observability Pattern
+```typescript
+// ✅ ALWAYS use this exact pattern
+.pipe(
+  Effect.tapError(Effect.logError), // Simple error logging
+  Effect.orDie, // OR let domain errors bubble up
+  Effect.withSpan('usecase-name', { 
+    attributes: { 
+      primitiveKey: primitiveValue // Only primitive attributes
+    } 
+  })
+)
+```
+
+## Data Transformation with Proper Error Handling
+
+### Business Logic Implementation
+```typescript
+export const getBlogPageUsecase = (input: GetBlogPageInput) =>
+  Effect.gen(function* () {
+    const searchStore = yield* SearchStore
+
+    // Get raw data from store
+    const algoliaResponse = yield* searchStore.getPage(input)
+    yield* Effect.annotateCurrentSpan('totalHits', algoliaResponse.nbHits)
+    yield* Effect.annotateCurrentSpan('totalPages', algoliaResponse.nbPages)
+    
+    // Transform Algolia hits to BlogPost objects (business logic)
+    const items = yield* Effect.forEach(
+      algoliaResponse.hits,
+      Schema.decodeUnknown(BlogSchema)
+    )
+    
+    // Calculate pagination (business logic in usecase, not store)
+    const totalItems = algoliaResponse.nbHits
+    const totalPages = Math.ceil(totalItems / input.limit)
+    const hasNext = input.page < totalPages - 1
+    const hasPrev = input.page > 1
+    
+    const result = PaginationSchema(BlogPost).make({
+      items,
+      totalItems,
+      totalPages,
+      currentPage: input.page,
+      perPage: input.limit,
+      hasNext,
+      hasPrev,
+    })
+    
+    return result
+  }).pipe(
+    Effect.tapError(Effect.logError),
+    Effect.withSpan('getBlogPageUsecase', { 
+      attributes: { 
+        page: input.page, 
+        limit: input.limit, 
+        sortBy: input.sortBy 
+      } 
+    }),
+    Effect.annotateLogs({ 
+      usecase: 'getBlogPageUsecase', 
+      page: input.page, 
+      limit: input.limit 
+    })
+  )
+```
+
+## JSDoc Documentation Standards
+
+### Comprehensive Documentation
+```typescript
+/**
+ * Retrieves all available blog post categories with pagination
+ * 
+ * This usecase handles the business logic for fetching categories:
+ * - Calls SearchStore to get raw Algolia facet data
+ * - Transforms facet hits into BlogPostCategory domain objects
+ * - Applies pagination logic and calculates page metadata
+ * - Returns paginated results with proper navigation flags
+ * 
+ * The transformation converts Algolia's facet structure:
+ * - `facetHit.value` becomes both `name` and `slug` for categories
+ * - Applies proper domain object construction with branded types
+ * - Handles empty results gracefully
+ * 
+ * @param input - Pagination parameters including page and limit
+ * @returns Paginated list of blog post categories with navigation metadata
+ * 
+ * @example
+ * ```typescript
+ * const input = { page: 1, limit: 10 }
+ * const result = yield* getAllCategoriesUsecase(input)
+ * // Returns: PaginationSchema<BlogPostCategory> with items and metadata
+ * ```
+ * 
+ * @throws {SearchError} When Algolia search fails
+ * @throws {ParseError} When category data cannot be decoded
+ */
+export const getAllCategoriesUsecase = (input: GetAllCategoriesInput) =>
+  // Implementation...
+```
+
+## Error Handling
+
+### Business Logic Error Handling
+```typescript
+export const dislikeBlogPostUsecase = (input: LikeInput) =>
+  Effect.gen(function* () {
+    const blogStore = yield* BlogStore
+    const blogPost = yield* blogStore.getById(input.id)
+    
+    // Business logic: Check if user has liked the post
+    if (!blogPost.likes?.includes(input.userId)) {
+      // Return domain error for business logic violation
+      return yield* new BlogPostLikeNotFoundError(input)
+    }
+    
+    // Continue with dislike logic...
+    const updatedLikes = blogPost.likes.filter((id) => id !== input.userId)
+    yield* blogStore.removeLike(input.id, input.userId)
+    
+    return LikeOutput.make({ likesCount: updatedLikes.length })
+  }).pipe(
+    Effect.tapError(Effect.logError),
+    Effect.withSpan('dislikeBlogPostUsecase', { 
+      attributes: { blogPostId: input.id, userId: input.userId } 
+    }),
+    Effect.annotateLogs({ 
+      usecase: 'dislikeBlogPostUsecase', 
+      blogPostId: input.id, 
+      userId: input.userId 
+    })
+  )
+```
+
+## Usecase Responsibilities
+
+### ✅ What Usecases Should Do
+- **Business Logic**: Implement domain-specific rules and validation
+- **Data Orchestration**: Coordinate between multiple stores
+- **Data Transformation**: Convert between external and domain formats
+- **Pagination Logic**: Calculate pagination metadata and navigation
+- **Error Context**: Add business context to errors
+- **Input Validation**: Validate business rules beyond schema validation
+- **Key Metrics Tracking**: Annotate spans with relevant business metrics
+- **BlogPostProfile Creation**: Transform BlogPost to BlogPostProfile for client endpoints
+
+### ❌ What Usecases Should NOT Do
+- **Direct Database Access**: Always use stores for data operations
+- **HTTP Concerns**: No response formatting or status codes
+- **External Service Calls**: Use stores for external service integration
+- **Schema Encoding/Decoding**: Let stores handle data transformation
+- **Infrastructure Concerns**: No direct external SDK usage, use Effect services
+- **Excessive Logging**: Avoid verbose start/completion logging
+- **Large Object Serialization**: Don't JSON.stringify large objects in logs
+
+## Testing Patterns
+
+### Usecase Testing with Mocked Stores
+```typescript
+describe('createBlogPostUsecase', () => {
+  it.effect('should create blog post with proper error handling', () =>
+    Effect.gen(function* () {
+      const input = { authorId: UserId.make('test-user') }
+      const result = yield* createBlogPostUsecase(input)
+      
+      expect(result.id).toBeDefined()
+      expect(result.authorId).toBe(input.authorId)
+      expect(result.status).toBe('new')
+      expect(result.title).toBe('placeholder')
+    }).pipe(
+      Effect.provide(
+        BlogStore.makeTestService({
+          create: (blogPost) => Effect.succeed(blogPost)
+        })
+      )
+    )
+  )
+  
+  it.effect('should handle store errors appropriately', () =>
+    Effect.gen(function* () {
+      const input = { authorId: UserId.make('test-user') }
+      const result = yield* Effect.exit(createBlogPostUsecase(input))
+      
+      expect(Exit.isFailure(result)).toBe(true)
+      if (Exit.isFailure(result)) {
+        expect(result.cause._tag).toBe('ConflictError')
+      }
+    }).pipe(
+      Effect.provide(
+        BlogStore.makeTestService({
+          create: () => new ConflictError({ resource: 'BlogPost', id: 'test-id' })
+        })
+      )
+    )
+  )
+})
+```
+
+### BlogPostProfile Testing Pattern
+```typescript
+describe('getBlogByIdUsecase', () => {
+  it.effect('should return blog post profile with author information', () =>
+    Effect.gen(function* () {
+      const mockAuthor = Author.make({
+        id: mockUser1.id,
+        username: mockUser1.username,
+        avatar: mockUser1.avatar,
+      })
+      
+      const expectedProfile = BlogPostProfile.make({
+        id: mockBlogPost1.id,
+        author: mockAuthor,
+        // ... rest of profile fields
+        likesCount: mockBlogPost1.likes.length,
+        dislikesCount: mockBlogPost1.dislikes.length,
+      })
+      
+      const result = yield* getBlogByIdUsecase(mockBlogPost1.id)
+      expect(result).toEqual(expectedProfile)
+    }).pipe(
+      Effect.provide(
+        BlogStore.makeTestService({
+          getById: () => Effect.succeed(mockBlogPost1)
+        })
+      ),
+      Effect.provide(
+        UserStore.makeTestService({
+          getAuthorById: () => Effect.succeed(mockAuthor)
+        })
+      )
+    )
+  )
+})
+```
+
+## ❌ CRITICAL ANTI-PATTERNS - Never Do These
+
+### Obvious Comments That Add No Value
+```typescript
+// ❌ WRONG: Comments that just repeat what code is doing
+// Transform Algolia hits to BlogPostItem objects using BlogItemSchema
+const items = yield* Schema.decodeUnknown(Schema.Array(BlogItemSchema))(res.hits)
+
+// ❌ WRONG: Comments stating the obvious
+// Get the blog post to check current likes
+const blogPost = yield* blogStore.getById(input.id)
+
+// ❌ WRONG: Comments that add no value
+// Calculate pagination metadata
+const hasNext = currentPage < totalPages - 1
+
+// ❌ WRONG: Comments that just describe the next line
+// Add the like
+yield* blogStore.addLike(input.id, input.userId)
+
+// ❌ WRONG: Comments that repeat function names
+// Store the blog post in the database
+yield* blogStore.create(blogPost)
+
+// ✅ CORRECT: No obvious comments - let the code speak for itself
+const items = yield* Schema.decodeUnknown(Schema.Array(BlogItemSchema))(res.hits)
+const blogPost = yield* blogStore.getById(input.id)
+const hasNext = currentPage < totalPages - 1
+yield* blogStore.addLike(input.id, input.userId)
+yield* blogStore.create(blogPost)
+
+// ✅ CORRECT: Only comment complex business logic that needs explanation
+// Apply boost multiplier only if boost hasn't expired and post is published
+if (blogPost.boost && blogPost.boost.expiresAt > new Date() && blogPost.status === 'published') {
+  popularityScore *= blogPost.boost.value
+}
+```
+
+### Verbose Error Logging
+```typescript
+// ❌ WRONG: Verbose error logging with custom messages
+Effect.tapError((error) =>
+  Effect.logError('getBlogPostUsecase failed', JSON.stringify({ error, input })),
+)
+
+// ❌ WRONG: Start/complete logging with JSON.stringify
+yield* Effect.logInfo('getBlogPostUsecase started', JSON.stringify(input))
+yield* Effect.logInfo('getBlogPostUsecase completed successfully', JSON.stringify(result))
+
+// ❌ WRONG: Manual error formatting
+Effect.catchAll((error) => 
+  Effect.logError(`Failed to execute usecase: ${error.message}`)
+)
+
+// ✅ CORRECT: Simple error logging only
+Effect.tapError(Effect.logError)
+```
+
+### Verbose Observability
+```typescript
+// ❌ WRONG: Annotating entire objects with JSON.stringify
+yield* Effect.annotateCurrentSpan('algoliaResponse', JSON.stringify(algoliaResponse))
+yield* Effect.annotateCurrentSpan('paginationResult', JSON.stringify(pagination))
+yield* Effect.annotateCurrentSpan('input', JSON.stringify(input))
+
+// ❌ WRONG: Annotating complex objects
+yield* Effect.annotateCurrentSpan('blogPost', blogPost)
+yield* Effect.annotateCurrentSpan('author', author)
+
+// ✅ CORRECT: Annotate specific primitive values only
+yield* Effect.annotateCurrentSpan('totalHits', res.nbHits)
+yield* Effect.annotateCurrentSpan('totalPages', res.nbPages)
+yield* Effect.annotateCurrentSpan('blogPostId', blogPost.id)
+yield* Effect.annotateCurrentSpan('authorId', author.id)
+```
+
+### Comment Guidelines
+- **NEVER** add comments that just repeat what the code is doing
+- **NEVER** add comments that state the obvious operation
+- **ONLY** comment complex business logic that needs explanation
+- **ONLY** comment non-obvious algorithms or calculations
+- **USE** JSDoc for public APIs, not inline comments for obvious operations
+- **PREFER** self-documenting code over comments
+
+### When Comments Are Acceptable
+```typescript
+// ✅ ACCEPTABLE: Complex business logic explanation
+// Apply popularity boost only for published posts with active, non-expired boosts
+// Boost calculation: base score * boost multiplier, capped at 1000
+if (blogPost.status === 'published' && 
+    blogPost.boost && 
+    blogPost.boost.expiresAt > new Date()) {
+  const boostedScore = Math.min(popularityScore * blogPost.boost.value, 1000)
+  popularityScore = boostedScore
+}
+
+// ✅ ACCEPTABLE: Non-obvious algorithm explanation  
+// Use Algolia's pagination: page 0-indexed in API, but 1-indexed for users
+const algoliaPage = Math.max(0, input.page - 1)
+
+// ✅ ACCEPTABLE: Important business rule clarification
+// Users can only like posts once - remove existing like before adding dislike
+if (blogPost.likes.includes(input.userId)) {
+  yield* blogStore.removeLike(input.id, input.userId)
+}
+```
+
+This rule ensures clean, readable code without redundant comments that provide no value.

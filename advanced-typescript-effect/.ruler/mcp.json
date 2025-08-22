@@ -1,0 +1,10 @@
+{
+	"mcpServers": {
+		"effect-docs": {
+			"command": "bunx",
+			"args": ["-y", "effect-mcp@latest"],
+			"env": {},
+			"alwaysAllow": ["effect_doc_search"]
+		}
+	}
+}

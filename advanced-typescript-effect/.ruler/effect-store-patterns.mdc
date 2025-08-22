@@ -1,0 +1,355 @@
+---
+description: 
+globs: **/stores/**/*.ts,**/*-store.ts,**/*.store.ts
+alwaysApply: false
+---
+# Effect-TS Store Implementation Patterns and Best Practices
+
+## Import Patterns
+
+See `.rules/imports-and-conventions.md` for import and naming conventions.
+
+## Store Service Definition
+
+### Service Class Structure
+```typescript
+export class BlogStore extends Effect.Service<BlogStore>()('BlogStore', {
+  dependencies: [DatabaseService],
+  effect: Effect.gen(function* () {
+    const db = yield* DatabaseService
+    
+    return {
+      create: (blogPost: BlogPost) => Effect.gen(function* () {
+        // Implementation
+      }),
+      getById: (id: BlogPostId) => Effect.gen(function* () {
+        // Implementation  
+      }),
+    }
+  }),
+}) {
+  static makeTestService = (
+    mockImplementation: Partial<Omit<BlogStore, '_tag'>>,
+  ) =>
+    Layer.succeed(BlogStore, {
+      _tag: 'BlogStore',
+      create: () => Effect.die('Not implemented' as const),
+      getById: () => Effect.die('Not implemented' as const),
+      ...mockImplementation,
+    })
+}
+```
+
+## Configuration Management
+
+### Environment Variables in config.ts
+- **ALWAYS** store environment variables in `config.ts` using Effect's Config system
+- Use `Config.string()` for regular values and `Config.redacted()` for sensitive data
+- Provide mock configuration for testing
+
+```typescript
+// config.ts
+import { Config, ConfigProvider, Layer } from 'effect'
+
+export const envVars = {
+  BLOG_TABLE: Config.string('BLOG_TABLE'),
+  USER_SERVICE_URL: Config.string('USER_SERVICE_URL'),
+  USER_SERVICE_API_KEY: Config.redacted('USER_SERVICE_API_KEY'),
+  ALGOLIA_APP_ID: Config.string('ALGOLIA_APP_ID'),
+  ALGOLIA_SEARCH_API_KEY: Config.redacted('ALGOLIA_SEARCH_API_KEY'),
+  ALGOLIA_WRITE_API_KEY: Config.redacted('ALGOLIA_WRITE_API_KEY'),
+  OPENAI_API_KEY: Config.redacted('OPENAI_API_KEY'),
+  CONTENT_BUCKET: Config.string('CONTENT_BUCKET'),
+} as const
+
+const mockConfigProvider = ConfigProvider.fromJson({
+  BLOG_TABLE: 'blog-table-test',
+  USER_SERVICE_URL: 'http://localhost:3000',
+  USER_SERVICE_API_KEY: 'USER_SERVICE_API_KEY',
+  ALGOLIA_APP_ID: 'ALGOLIA_APP_ID',
+  ALGOLIA_SEARCH_API_KEY: 'ALGOLIA_SEARCH_API_KEY',
+  ALGOLIA_WRITE_API_KEY: 'ALGOLIA_WRITE_API_KEY',
+  OPENAI_API_KEY: 'OPENAI_API_KEY',
+  CONTENT_BUCKET: 'CONTENT_BUCKET',
+})
+
+export const MockConfigLayer = Layer.setConfigProvider(mockConfigProvider)
+```
+
+### Using Configuration in Stores
+```typescript
+export class BlogStore extends Effect.Service<BlogStore>()('BlogStore', {
+  dependencies: [DatabaseService],
+  effect: Effect.gen(function* () {
+    const db = yield* DatabaseService
+    const tableName = yield* envVars.BLOG_TABLE
+    
+    return {
+      create: (blogPost: BlogPost) => Effect.gen(function* () {
+        const encoded = yield* Schema.encode(BlogSchema)(blogPost)
+        yield* db.insert({
+          table: tableName,
+          data: encoded,
+          onConflict: 'throw',
+        })
+        return blogPost
+      }),
+    }
+  }),
+})
+```
+
+## Store Method Patterns
+
+### CRUD Operations
+```typescript
+// CREATE - Insert new record
+create: (blogPost: BlogPost) =>
+  Effect.gen(function* () {
+    yield* Effect.logInfo('Creating blog post', { id: blogPost.id })
+    
+    const encoded = yield* Schema.encode(BlogSchema)(blogPost)
+    const result = yield* db.insert({
+      table: tableName,
+      data: encoded,
+      onConflict: 'throw',
+    }).pipe(
+      Effect.catchTag('ConditionalCheckFailedException', () =>
+        new ConflictError({ resource: 'BlogPost', id: blogPost.id })
+      )
+    )
+    
+    yield* Effect.logInfo('Blog post created successfully', { id: blogPost.id })
+    return blogPost
+  }).pipe(
+    Effect.withSpan('BlogStore.create', { attributes: { id: blogPost.id } })
+  ),
+
+// READ - Get by ID
+getById: (id: BlogPostId) =>
+  Effect.gen(function* () {
+    yield* Effect.logInfo('Getting blog post by ID', { id })
+    
+    const result = yield* db.findById({
+      table: tableName,
+      id,
+    })
+    
+    const item = yield* Effect.fromNullable(result.Item).pipe(
+      Effect.catchTag('NoSuchElementException', () =>
+        new NotFoundError({ resource: 'BlogPost', id })
+      )
+    )
+    
+    const decoded = yield* Schema.decodeUnknown(BlogSchema)(item)
+    
+    yield* Effect.logInfo('Blog post retrieved successfully', { id })
+    return decoded
+  }).pipe(
+    Effect.withSpan('BlogStore.getById', { attributes: { id } })
+  ),
+
+// UPDATE - Patch existing record
+updateAttributes: (id: BlogPostId, updates: Partial<BlogPost>) =>
+  Effect.gen(function* () {
+    yield* Effect.logInfo('Updating blog post attributes', { id, updates })
+    
+    const existing = yield* getById(id)
+    const updated = { ...existing, ...updates, updatedAt: new Date() }
+    const encoded = yield* Schema.encode(BlogSchema)(updated)
+    
+    yield* db.update({
+      table: tableName,
+      data: encoded,
+    })
+    
+    yield* Effect.logInfo('Blog post updated successfully', { id })
+    return updated
+  }).pipe(
+    Effect.withSpan('BlogStore.updateAttributes', { attributes: { id } })
+  ),
+
+// DELETE - Remove record
+delete: (id: BlogPostId) =>
+  Effect.gen(function* () {
+    yield* Effect.logInfo('Deleting blog post', { id })
+    
+    yield* db.delete({
+      table: tableName,
+      id,
+      requireExists: true,
+    }).pipe(
+      Effect.catchTag('ConditionalCheckFailedException', () =>
+        new NotFoundError({ resource: 'BlogPost', id })
+      )
+    )
+    
+    yield* Effect.logInfo('Blog post deleted successfully', { id })
+  }).pipe(
+    Effect.withSpan('BlogStore.delete', { attributes: { id } })
+  ),
+```
+
+### Query Operations
+```typescript
+// Query with GSI
+getByAuthor: (authorId: string) =>
+  Effect.gen(function* () {
+    yield* Effect.logInfo('Getting blog posts by author', { authorId })
+    
+    const result = yield* db.query({
+      table: tableName,
+      index: 'author-index',
+      where: { authorId },
+    })
+    
+    const items = result.Items || []
+    const decoded = yield* Effect.forEach(items, Schema.decodeUnknown(BlogSchema))
+    
+    yield* Effect.logInfo('Blog posts retrieved by author', { 
+      authorId, 
+      count: decoded.length 
+    })
+    return decoded
+  }).pipe(
+    Effect.withSpan('BlogStore.getByAuthor', { attributes: { authorId } })
+  ),
+```
+
+### External Service Integration
+```typescript
+// Algolia integration
+searchForHits: (query: string, page: number, limit: number) =>
+  Effect.gen(function* () {
+    yield* Effect.logInfo('Searching Algolia for hits', { query, page, limit })
+    
+    const result = yield* algoliaClient.search({
+      indexName: 'blog_posts',
+      query,
+      hitsPerPage: limit,
+      page: page - 1, // Algolia is 0-indexed
+    })
+    
+    yield* Effect.logInfo('Algolia search completed', { 
+      query, 
+      hits: result.hits.length,
+      nbHits: result.nbHits 
+    })
+    
+    // Return raw Algolia response - let usecase handle pagination logic
+    return result
+  }).pipe(
+    Effect.withSpan('BlogStore.searchForHits', { 
+      attributes: { query, page, limit } 
+    })
+  ),
+```
+
+## Error Handling
+
+### Convert External Errors to Domain Errors
+```typescript
+// Database errors
+.pipe(
+  Effect.catchTag('ConditionalCheckFailedException', () =>
+    new ConflictError({ resource: 'BlogPost', id })
+  ),
+  Effect.catchTag('ResourceNotFoundException', () =>
+    new NotFoundError({ resource: 'Table', id: TableName })
+  )
+)
+
+// Storage errors
+.pipe(
+  Effect.catchTag('FileNotFound', () =>
+    new NotFoundError({ resource: 'File', id: key })
+  )
+)
+```
+
+## Logging and Observability
+
+### Structured Logging
+```typescript
+// Log inputs
+yield* Effect.logInfo('Operation started', { 
+  operation: 'create',
+  input: JSON.stringify(input, null, 2) 
+})
+
+// Log intermediate steps
+yield* Effect.logInfo('Database operation completed', { 
+  tableName: TableName,
+  operation: 'put',
+  itemId: blogPost.id 
+})
+
+// Log outputs
+yield* Effect.logInfo('Operation completed successfully', { 
+  operation: 'create',
+  result: { id: blogPost.id, title: blogPost.title }
+})
+```
+
+### Spans for Tracing
+```typescript
+.pipe(
+  Effect.withSpan('BlogStore.methodName', { 
+    attributes: { 
+      id,
+      operation: 'create',
+      tableName: TableName 
+    } 
+  })
+)
+```
+
+## Testing Support
+
+### Test Service Implementation
+```typescript
+static makeTestService = (
+  mockImplementation: Partial<Omit<BlogStore, '_tag'>>,
+) =>
+  Layer.succeed(BlogStore, {
+    _tag: 'BlogStore',
+    // Default implementations that fail
+    create: () => Effect.die('Not implemented' as const),
+    getById: () => Effect.die('Not implemented' as const),
+    updateAttributes: () => Effect.die('Not implemented' as const),
+    delete: () => Effect.die('Not implemented' as const),
+    getByAuthor: () => Effect.die('Not implemented' as const),
+    searchForHits: () => Effect.die('Not implemented' as const),
+    // Override with provided implementations
+    ...mockImplementation,
+  })
+```
+
+### Test Usage
+```typescript
+const testStore = BlogStore.makeTestService({
+  create: () => Effect.succeed(mockBlogPost1),
+  getById: (id) => 
+    id === 'existing-id' 
+      ? Effect.succeed(mockBlogPost1)
+      : new NotFoundError({ resource: 'BlogPost', id }),
+})
+```
+
+## Store Responsibilities
+
+### ✅ What Stores Should Do
+- Data persistence and retrieval operations
+- Schema encoding/decoding between domain and storage formats
+- External service integration (Database, Search, Storage, etc.)
+- Convert external errors to domain errors
+- Structured logging of data operations
+- Return raw data without business logic processing
+
+### ❌ What Stores Should NOT Do
+- Business logic or validation
+- Pagination calculations (return raw results)
+- Data transformation beyond encoding/decoding
+- Cross-store operations or orchestration
+- User-facing error messages
+- Authentication or authorization

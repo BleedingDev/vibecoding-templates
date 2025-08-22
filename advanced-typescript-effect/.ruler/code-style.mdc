@@ -1,0 +1,351 @@
+---
+description: Code Style Guide
+globs: src/**/*.ts
+alwaysApply: false
+---
+# T6C Effect-TS Code Style Guide
+
+Guidelines for code style in the T6C project using Effect-TS architecture.
+
+## Import Patterns
+
+See `.rules/imports-and-conventions.md` for import conventions.
+
+## Comments and Documentation
+
+### Avoid Obvious Comments
+- **NEVER** add comments that just repeat what the code is doing
+- Only add comments for complex business logic that needs explanation
+- Use JSDoc for public APIs, not inline comments for obvious operations
+
+```typescript
+// ✅ CORRECT - No obvious comments, code is self-explanatory
+const generatedData = yield* generateBlogPostData(patches)
+const updates = createBlogPostPatches(patches, generatedData)
+const uniqueSlug = yield* findUniqueSlug(generatedData.slug)
+
+// ❌ WRONG - Obvious comments that add no value
+// Generate comprehensive blog post data using AI
+const generatedData = yield* generateBlogPostData(patches)
+// Create complete patches with generated data
+const updates = createBlogPostPatches(patches, generatedData)
+// Ensure slug uniqueness
+const uniqueSlug = yield* findUniqueSlug(generatedData.slug)
+```
+
+### When to Use Comments
+- **Complex business logic** that isn't obvious from function names
+- **Non-obvious workarounds** or edge cases
+- **Important context** that affects future changes
+- **Never** for operations that are clear from function/variable names
+
+```typescript
+// ✅ CORRECT - Explains non-obvious business rule
+// User must have liked the post before they can dislike it
+if (!blogPost.likes?.includes(input.userId)) {
+  return yield* new BlogPostLikeNotFoundError(input)
+}
+
+// ❌ WRONG - Obvious comment
+// Check if user exists
+const user = yield* userStore.getById(userId)
+```
+
+## Effect-TS Service Architecture
+
+### Service Class Structure
+- Use `Effect.Service` class extension pattern
+- Include dependencies in service definition
+- Provide `makeTestService` for testing
+
+```typescript
+export class BlogStore extends Effect.Service<BlogStore>()('BlogStore', {
+  dependencies: [DatabaseService, ConfigService],
+  effect: Effect.gen(function* () {
+    const db = yield* DatabaseService
+    const config = yield* ConfigService
+
+    return {
+      create: (blogPost: BlogPost) => Effect.gen(function* () {
+        // Implementation
+      }),
+      getById: (id: BlogPostId) => Effect.gen(function* () {
+        // Implementation
+      }),
+    }
+  }),
+}) {
+  static makeTestService = (
+    mockImplementation: Partial<Omit<BlogStore, '_tag'>>,
+  ) =>
+    Layer.succeed(BlogStore, {
+      _tag: 'BlogStore',
+      create: () => Effect.die('Not implemented' as const),
+      getById: () => Effect.die('Not implemented' as const),
+      ...mockImplementation,
+    })
+}
+```
+
+### Effect Generator Functions
+- Use `Effect.gen(function* () {})` for complex flows
+- Yield effects directly without helper functions
+- Use `yield*` for effects that return values
+
+```typescript
+// ✅ CORRECT
+const usecase = (id: BlogPostId) =>
+  Effect.gen(function* () {
+    const blogStore = yield* BlogStore
+    const result = yield* blogStore.getById(id)
+    return result
+  }).pipe(Effect.tapError, Effect.withSpan('my-usecase-name', { attributes: { id }}))
+
+// ❌ WRONG - Don't use helper functions like _()
+const usecase = (id: BlogPostId) =>
+  Effect.gen(function* (_) {
+    const blogStore = yield* _(BlogStore)
+    const result = yield* _(blogStore.getById(id))
+    return result
+  })
+```
+
+## Error Handling
+
+### Tagged Errors
+- Use `Data.Tagged` for domain errors
+- Create specific error types for different failure cases
+- Handle errors explicitly with `Effect.catchTags`
+
+```typescript
+// Error definition
+export class NotFoundError extends Data.TaggedError('NotFoundError')<{
+  readonly resource: string
+  readonly id: string
+}> {}
+
+// Error handling
+Effect.catchTags({
+  NotFoundError: (error) => notFoundResponse(error.message),
+  ConflictError: (error) => conflictResponse(error.message),
+})
+```
+
+## Logging and Observability
+
+### Structured Logging
+- Use Effect's logging utilities instead of `console.log`
+- Include relevant context in log messages
+- Use appropriate log levels
+
+```typescript
+// ✅ CORRECT
+yield* Effect.logInfo('Creating blog post', { id: blogPost.id, title: blogPost.title })
+yield* Effect.logError('Failed to create blog post', { error, id: blogPost.id })
+
+// ❌ WRONG
+console.log('Creating blog post', blogPost.id)
+```
+
+### Tracing with Spans
+- Add spans for observability
+- Include relevant attributes
+- Use descriptive span names
+
+```typescript
+Effect.withSpan('BlogStore.create', {
+  attributes: { id: blogPost.id, authorId: blogPost.authorId }
+})
+```
+
+## Naming Conventions (Code)
+
+### Classes, Types, and Interfaces
+- Use PascalCase for classes, types, and interfaces: `BlogStore`, `SearchStore`, `MyType`, `MyInterface`
+
+### Variables and Functions
+- Use camelCase for variables and functions: `blogPost`, `getBlogById`
+
+### Constants and Enums
+- Use ALL_CAPS for constants: `TABLE_NAME`, `DEFAULT_LIMIT`
+- For existing enums, use ALL_CAPS for enum values (e.g., `Color.RED`). Do not introduce new enums; see `.rules/enums.md` for alternatives.
+
+### Functions and Methods
+- Use descriptive names that indicate purpose
+- Prefix usecases with action: `createBlogPostUsecase`, `getBlogByIdUsecase`
+- Prefix handlers with HTTP method context: `_handler`, `handler`
+
+### Generic Type Parameters
+- Prefix generic type parameters with `T` (e.g., `TItem`, `TKey`, `TValue`, `TResult`).
+- Avoid single-letter generics except a solitary `T` in simple cases; prefer descriptive names.
+
+Example:
+
+```ts
+type RecordOfArrays<TItem> = Record<string, TItem[]>;
+```
+
+## Type Safety
+
+### Schema Validation
+- Use Effect Schema for all data validation
+- Define schemas with explicit types
+- Use branded types for domain identifiers
+
+```typescript
+// Schema definition
+export const BlogSchema = Schema.Struct({
+  id: BlogPostId,
+  title: Schema.String,
+  content: Schema.String,
+  authorId: UserId,
+  createdAt: Schema.Date,
+})
+
+// Usage
+const decoded = yield* Schema.decodeUnknown(BlogSchema)(rawData)
+```
+
+### Branded Types
+- Use branded types for domain identifiers
+- Create factory functions with validation
+
+```typescript
+export const BlogPostId = Schema.String.pipe(Schema.brand('BlogPostId'))
+export type BlogPostId = Schema.Schema.Type<typeof BlogPostId>
+```
+
+## Configuration Management
+
+### Environment Variables in config.ts
+- **ALWAYS** store environment variables in `config.ts` using Effect's Config system
+- Use `Config.string()` for regular values and `Config.redacted()` for sensitive data
+- Provide mock configuration for testing
+- **NEVER** access `process.env` directly in application code
+
+```typescript
+// config.ts
+import { Config, ConfigProvider, Layer } from 'effect'
+
+export const envVars = {
+  BLOG_TABLE: Config.string('BLOG_TABLE'),
+  USER_SERVICE_API_KEY: Config.redacted('USER_SERVICE_API_KEY'),
+  ALGOLIA_APP_ID: Config.string('ALGOLIA_APP_ID'),
+} as const
+
+const mockConfigProvider = ConfigProvider.fromJson({
+  BLOG_TABLE: 'blog-table-test',
+  USER_SERVICE_API_KEY: 'USER_SERVICE_API_KEY',
+  ALGOLIA_APP_ID: 'ALGOLIA_APP_ID',
+})
+
+export const MockConfigLayer = Layer.setConfigProvider(mockConfigProvider)
+```
+
+### Configuration Access Pattern
+```typescript
+// ✅ CORRECT - Access config through Effect system
+export class BlogStore extends Effect.Service<BlogStore>()('BlogStore', {
+  effect: Effect.gen(function* () {
+    const tableName = yield* envVars.BLOG_TABLE
+    const apiKey = yield* envVars.USER_SERVICE_API_KEY
+    // Use configuration values...
+  }),
+})
+
+// ❌ WRONG - Direct environment access
+const tableName = process.env.BLOG_TABLE
+```
+
+## Function Composition
+
+### Pipe Syntax
+- Use pipe syntax for effect composition
+- Chain operations logically
+- Keep pipes readable with proper formatting
+
+```typescript
+const result = yield* blogStore.getById(id).pipe(
+  Effect.flatMap((blog) => enrichBlogPost(blog)),
+  Effect.map((enriched) => formatResponse(enriched)),
+  Effect.withSpan('get-blog-enriched'),
+)
+```
+
+### Pure Functions
+- Write pure functions without side effects
+- Use Effect for operations with side effects
+- Keep business logic separate from infrastructure
+
+## MANDATORY Usecase Patterns
+
+### Required Logging and Observability
+**EVERY usecase MUST follow this exact pattern:**
+
+```typescript
+export const myUsecase = (input: MyInput) =>
+  Effect.gen(function* () {
+    // Business logic implementation here...
+    const result = yield* businessLogic(input)
+    return result
+  }).pipe(
+    // 🔴 MANDATORY: Simple error logging
+    Effect.tapError(Effect.logError),
+    // 🔴 MANDATORY: Observability span with relevant attributes
+    Effect.withSpan('my-usecase-name', {
+      attributes: { id: input.id } // Include relevant attributes
+    })
+  )
+```
+
+## Testing Patterns
+
+### Use @effect/vitest
+- Always use `@effect/vitest` for Effect-based tests
+- Use appropriate test variants: `it.effect`, `it.scoped`, `it.live`
+- Mock services using `makeTestService`
+
+```typescript
+import { describe, expect, it } from '@effect/vitest'
+
+it.effect('should create blog post', () =>
+  Effect.gen(function* () {
+    const blogStore = yield* BlogStore
+    const result = yield* blogStore.create(mockBlogPost)
+    expect(result.id).toBe(mockBlogPost.id)
+  }).pipe(
+    Effect.provide(BlogStore.makeTestService({
+      create: () => Effect.succeed(mockBlogPost),
+    }))
+  )
+)
+```
+
+## Documentation
+
+### JSDoc Standards
+- Document public APIs with JSDoc
+- Include parameter descriptions and examples
+- Document error conditions
+
+```typescript
+/**
+ * Creates a new blog post in the system.
+ *
+ * @param blogPost - The blog post data to create
+ * @returns Effect that succeeds with the created blog post
+ * @throws ConflictError when a blog post with the same ID already exists
+ * @throws ValidationError when the blog post data is invalid
+ *
+ * @example
+ * ```typescript
+ * const result = yield* blogStore.create({
+ *   id: BlogPostId.make('123'),
+ *   title: 'My Blog Post',
+ *   content: 'Content here...',
+ *   authorId: UserId.make('author-123')
+ * })
+ * ```
+ */
+create: (blogPost: BlogPost) => Effect<BlogPost, ConflictError | ValidationError>
+```

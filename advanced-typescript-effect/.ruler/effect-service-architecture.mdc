@@ -1,0 +1,252 @@
+---
+description: Comprehensive Effect-TS service architecture patterns covering stores, usecases, handlers, and testing for building scalable applications
+globs:
+alwaysApply: false
+---
+# Effect-TS Service Architecture Patterns and Best Practices
+
+## 1. Import Patterns
+
+See `.rules/imports-and-conventions.md` for import and naming conventions.
+
+## 2. Store Layer (Data Access)
+
+### Service Class Structure
+```typescript
+export class BlogStore extends Effect.Service<BlogStore>()('BlogStore', {
+  dependencies: [DatabaseService, ConfigService],
+  effect: Effect.gen(function* () {
+    const db = yield* DatabaseService
+    const config = yield* ConfigService
+
+    return {
+      create: (blogPost: BlogPost) => Effect.gen(function* () {
+        // Implementation
+      }),
+      getById: (id: BlogPostId) => Effect.gen(function* () {
+        // Implementation
+      }),
+    }
+  }),
+}) {}
+```
+
+### Store Responsibilities
+- ✅ Data persistence and retrieval only
+- ✅ Schema encoding/decoding
+- ✅ External service integration (Database, Search, Storage)
+- ✅ Return raw data without business logic processing
+- ❌ No pagination calculations or business logic
+
+## 3. Usecase Layer (Business Logic)
+
+### Usecase Structure
+```typescript
+/**
+ * Creates a new blog post with default values
+ * @param input - Blog post creation input
+ * @returns Created blog post with generated ID and timestamps
+ */
+export const createBlogPostUsecase = (input: CreateBlogPostInput) =>
+  Effect.gen(function* () {
+    const blogStore = yield* BlogStore
+
+    const blogPostData = BlogPost.make({
+      id: BlogPostId.make(randomUUID()),
+      ...input,
+      // ... other fields
+    })
+
+    const createdBlogPost = yield* blogStore.create(blogPostData)
+
+    return createdBlogPost
+  }).pipe(
+    Effect.tapError(Effect.logError), // Simple error logging
+    Effect.withSpan('createBlogPostUsecase', { 
+      attributes: { authorId: input.authorId }
+    })
+  )
+```
+
+### Logging and Observability
+
+See `.rules/logging-and-observability.md` for logging and span patterns.
+
+### Usecase Responsibilities
+- ✅ Business logic and orchestration
+- ✅ Pagination calculations and data transformation
+- ✅ Detailed JSDoc documentation
+- ✅ Error handling with Effect.tapError(Effect.logError)
+- ❌ No direct database or external service calls
+
+## 4. Handler Layer (HTTP Interface)
+
+### Handler Structure
+```typescript
+export const _handler = schemaBody(CreateBlogPostInput).pipe(
+  Effect.flatMap(createBlogPostUsecase),
+  Effect.flatMap(createdResponse),
+  Effect.catchTags({
+    ParseError: (error) => badRequestResponse(error.message),
+    ConflictError: () => conflictResponse('Blog post already exists'),
+  }),
+  Effect.orDie,
+  Effect.withSpan('create-blog-post'),
+)
+
+export const handler = _handler.pipe(
+  Effect.provide(BlogStore.Default),
+  Effect.withSpan('create-blog-post-handler'),
+  toHandler,
+)
+```
+
+### Handler Responsibilities
+- ✅ Input validation using schemas
+- ✅ Usecase delegation
+- ✅ Response formatting
+- ✅ Error mapping to HTTP responses
+- ✅ Service dependency injection
+
+## 5. Testing Patterns
+
+### Store Testing
+```typescript
+import { describe, expect, it } from '@effect/vitest'
+
+describe('BlogStore', () => {
+  it('should create a blog post', async () => {
+    const result = await BlogStore.pipe(
+      Effect.flatMap((store) => store.create(mockBlogPost1)),
+      Effect.provide(
+        BlogStore.makeTestService({
+          create: () => Effect.succeed(mockBlogPost1),
+        }),
+      ),
+      Effect.provide(MockConfigLayer),
+      Effect.runPromise,
+    )
+    expect(result.title).toEqual(mockBlogPost1.title)
+  })
+
+  it.effect('should handle errors with Effect test', () =>
+    Effect.gen(function* () {
+      const store = yield* BlogStore
+      const result = yield* Effect.exit(store.getById('non-existent'))
+      expect(Exit.isFailure(result)).toBe(true)
+    }).pipe(
+      Effect.provide(BlogStore.makeTestService({
+        getById: () => new NotFoundError({ resource: 'BlogPost', id: 'non-existent' })
+      }))
+    )
+  )
+})
+```
+
+### Usecase Testing
+```typescript
+it.effect('should create blog post with proper logging', () =>
+  Effect.gen(function* () {
+    const result = yield* createBlogPostUsecase(mockInput)
+    expect(result.id).toBeDefined()
+    expect(result.authorId).toBe(mockInput.authorId)
+  }).pipe(
+    Effect.provide(BlogStore.makeTestService({
+      create: () => Effect.succeed(mockBlogPost1)
+    }))
+  )
+)
+```
+
+## 6. Error Handling
+
+### Tagged Errors
+```typescript
+export class BlogPostNotFoundError extends Data.TaggedError('BlogPostNotFoundError')<{
+  readonly id: string
+}> {}
+
+export class BlogPostConflictError extends Data.TaggedError('BlogPostConflictError')<{
+  readonly slug: string
+}> {}
+```
+
+### Error Handling in Layers
+```typescript
+// Store: Convert external errors to domain errors
+const result = yield* db.get(params).pipe(
+  Effect.catchTag('ItemNotFound', () =>
+    new BlogPostNotFoundError({ id })
+  )
+)
+
+// Usecase: Add context and logging
+const blogPost = yield* blogStore.getById(id).pipe(
+  Effect.tapError((error) =>
+    Effect.logError('Failed to retrieve blog post', JSON.stringify({ error, id }))
+  )
+)
+
+// Handler: Map to HTTP responses
+Effect.catchTags({
+  BlogPostNotFoundError: () => notFoundResponse('Blog post not found'),
+  BlogPostConflictError: () => conflictResponse('Blog post already exists'),
+})
+```
+
+## 7. Service Definition
+
+### Always define service with default implementation as `Effect.Service`
+- There is one main implementation of a service
+- There is only one implementation of a service
+
+#### ✅ CORRECT - Service with default implementation as `Effect.Service`
+```typescript
+export class BlogStore extends Effect.Service<BlogStore>()('BlogStore', {
+  dependencies: [DynamoDBService, ConfigService],
+  effect: Effect.gen(...)
+}){}
+```
+
+### Always define service with multiple implementations as `Context.Tag`
+- There are multiple implementations of a service
+- There is no clear default implementation
+
+#### ✅ CORRECT - Service with multiple implementations as `Context.Tag`
+```typescript
+export class MediaStore extends Context.Tag('MediaStore')<
+  MediaStore,
+  {/* required methods interface */}
+>() {
+  static Deepgram = MediaStore.of({/* required methods */})
+
+  static Gemini = MediaStore.of({/* required methods */})
+
+  static makeTestService = (
+    mockImplementation: Partial<Parameters<typeof MediaStore.of>[0]>,
+  ) =>
+    MediaStore.of({
+      /* required methods */
+      ...mockImplementation,
+    })
+}
+```
+
+## 8. Architecture Principles
+
+### Separation of Concerns
+- **Stores**: Data access and external service integration
+- **Usecases**: Business logic, validation, and orchestration
+- **Handlers**: HTTP interface and response formatting
+
+### Dependency Flow
+- Handlers depend on Usecases
+- Usecases depend on Stores
+- Stores depend on external services (Database, Search, etc.)
+- Never skip layers or create circular dependencies
+
+### Error Propagation
+- Use tagged errors for type-safe error handling
+- Convert external errors to domain errors at store boundaries
+- Add context and logging at usecase level
+- Map to appropriate HTTP responses at handler level
