@@ -43,7 +43,7 @@ dt = datetime.now(timezone.utc)
 
 ```
 
-Our Python (3.10) includes the **zoneinfo** module. This provides access to the standard IANA database of time zones.
+Our Python (3.12) includes the **zoneinfo** module. This provides access to the standard IANA database of time zones.
 
 > [PEP 615](https://www.python.org/dev/peps/pep-0615/) describes support for the IANA time zone database with **zoneinfo**.
 
